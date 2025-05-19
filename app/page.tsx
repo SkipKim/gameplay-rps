@@ -10,6 +10,8 @@ interface Room {
   created_at: string;
   status: string;
   player_count: number;
+  game_type: string;
+  board_size: number;
 }
 
 export default function MainPage() {
@@ -19,6 +21,9 @@ export default function MainPage() {
   const [rooms, setRooms] = useState<Room[]>([]);
   const [roomLoading, setRoomLoading] = useState(false);
   const [playerCounts, setPlayerCounts] = useState<{ [roomId: string]: number }>({});
+  const [gameType, setGameType] = useState<'knight_tour' | 'rps'>("knight_tour");
+  const [boardSize, setBoardSize] = useState<5 | 6 | 8>(8);
+  const [myPlayingRooms, setMyPlayingRooms] = useState<{ [roomId: string]: boolean }>({});
   const router = useRouter();
 
   // 유저 정보 및 세션 체크
@@ -50,7 +55,7 @@ export default function MainPage() {
     const fetchRooms = async () => {
       const { data, error } = await supabase
         .from("rooms")
-        .select("id, host_id, created_at, status, player_count")
+        .select("id, host_id, created_at, status, player_count, game_type, board_size")
         .order("created_at", { ascending: false });
       if (!error && data) setRooms(data as Room[]);
     };
@@ -66,40 +71,55 @@ export default function MainPage() {
 
   // rooms 목록이 바뀔 때마다 각 방의 players count 가져오기 + players 실시간 구독
   useEffect(() => {
-    if (rooms.length === 0) return;
-    const fetchAllCounts = async () => {
+    if (rooms.length === 0 || !userId) return;
+    const fetchAllCountsAndMyPlaying = async () => {
       const counts: { [roomId: string]: number } = {};
+      const playing: { [roomId: string]: boolean } = {};
       await Promise.all(
         rooms.map(async (room) => {
-          const { count } = await supabase
+          const { data, count } = await supabase
             .from("players")
-            .select("*", { count: "exact", head: true })
+            .select("user_id, is_player", { count: "exact" })
             .eq("room_id", room.id);
           counts[room.id] = count ?? 0;
+          if (data && Array.isArray(data)) {
+            playing[room.id] = data.some(p => p.user_id === userId && p.is_player);
+          } else {
+            playing[room.id] = false;
+          }
         })
       );
       setPlayerCounts(counts);
+      setMyPlayingRooms(playing);
     };
-    fetchAllCounts();
+    fetchAllCountsAndMyPlaying();
     // players 테이블 실시간 구독 추가
     const channel = supabase.channel('players-realtime-lobby')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'players' }, fetchAllCounts)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'players' }, fetchAllCountsAndMyPlaying)
       .subscribe();
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [rooms]);
+  }, [rooms, userId]);
 
   // 방 생성
   const handleCreateRoom = async () => {
     if (!userId || !userEmail) return;
     setRoomLoading(true);
+    const insertRoom: any = {
+      host_id: userId,
+      status: "waiting",
+      game_type: gameType,
+    };
+    if (gameType === "knight_tour") {
+      insertRoom.board_size = boardSize;
+    }
     const { data, error } = await supabase
       .from("rooms")
-      .insert({ host_id: userId, status: "waiting", player_count: 1 })
+      .insert(insertRoom)
       .select();
     if (!error && data && data[0]) {
-      // 방장도 플레이어로 자동 등록 (room_id, user_id, user_email 모두 명시)
+      // 방장도 플레이어로 자동 등록 (is_player: true)
       await supabase
         .from("players")
         .insert({ room_id: data[0].id, user_id: userId, user_email: userEmail });
@@ -126,7 +146,7 @@ export default function MainPage() {
 
   return (
     <div style={{ maxWidth: 400, margin: "40px auto", padding: 24, border: "1px solid #eee", borderRadius: 8 }}>
-      <h2>가위바위보 게임 로비</h2>
+      <h2>게임 로비</h2>
       <p>안녕하세요, <b>{userEmail}</b> 님!</p>
       <button
         onClick={handleLogout}
@@ -135,6 +155,32 @@ export default function MainPage() {
         로그아웃
       </button>
       <hr style={{ margin: "24px 0" }} />
+      {/* 게임 종류/판 크기 선택 폼 */}
+      <div style={{ marginBottom: 16 }}>
+        <label style={{ fontWeight: 600 }}>게임 종류: </label>
+        <select
+          value={gameType}
+          onChange={e => setGameType(e.target.value as 'knight_tour' | 'rps')}
+          style={{ marginLeft: 8, padding: 4 }}
+        >
+          <option value="knight_tour">기사의 여행</option>
+          <option value="rps">가위바위보</option>
+        </select>
+        {gameType === "knight_tour" && (
+          <>
+            <label style={{ marginLeft: 16, fontWeight: 600 }}>판 크기: </label>
+            <select
+              value={boardSize}
+              onChange={e => setBoardSize(Number(e.target.value) as 5 | 6 | 8)}
+              style={{ marginLeft: 8, padding: 4 }}
+            >
+              <option value={5}>5x5</option>
+              <option value={6}>6x6</option>
+              <option value={8}>8x8</option>
+            </select>
+          </>
+        )}
+      </div>
       <button
         onClick={handleCreateRoom}
         disabled={roomLoading}
@@ -149,7 +195,17 @@ export default function MainPage() {
         <ul style={{ listStyle: 'none', padding: 0 }}>
           {rooms.map(room => (
             <li key={room.id} style={{ marginBottom: 12, border: '1px solid #ddd', borderRadius: 6, padding: 12, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <span>방 ID: {room.id.slice(0, 8)}... | 인원: {playerCounts[room.id] ?? 0} | 상태: {room.status}</span>
+              <span>
+                방 ID: {room.id.slice(0, 8)}... |
+                인원: {playerCounts[room.id] ?? 0} |
+                게임: {room.game_type === 'knight_tour' ? `기사의 여행(${room.board_size}x${room.board_size})` : '가위바위보'} |
+                상태: {room.status}
+                {myPlayingRooms[room.id] && (
+                  <span style={{ marginLeft: 8, background: '#0070f3', color: 'white', borderRadius: 4, padding: '2px 8px', fontSize: 12, fontWeight: 600 }}>
+                    플레이중
+                  </span>
+                )}
+              </span>
               <div style={{ display: 'flex', gap: 8 }}>
                 <button
                   onClick={() => handleEnterRoom(room.id)}
